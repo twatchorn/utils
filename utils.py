@@ -31,7 +31,7 @@ def log(wrkdir, message):
 
 # ── CONTACT FILE LOADING ──────────────────────────────────────────────────────
 
-def class load_contacts(cont_file):
+def load_contacts(cont_file):
     """
     Load CA contact pairs from a SMOG .contacts file.
     Returns zero-indexed integer pair array of shape (n_contacts, 2).
