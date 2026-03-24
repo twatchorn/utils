@@ -6,7 +6,7 @@ Consolidated analysis functions for GO-model folding landscape generation.
 Covers: Q(t), RMSD, Rg, contact probability maps, WHAM, heat capacity, and 2D free energy landscapes.
 
 Usage in Colab:
-    !wget https://raw.githubusercontent.com/YOURUSERNAME/YOURREPO/main/utils.py
+    !wget https://raw.githubusercontent.com/twatchorn/utils/main/utils.py
     import utils
 """
 
