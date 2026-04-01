@@ -450,7 +450,12 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000, rep
     csv_file = os.path.join(output_dir, f"energy_{tag}.csv")
 
     print(f'\n  Running T = {temperature_K:.0f} K ...')
-
+        if hasattr(sbm, 'simulation') and sbm.simulation is not None:
+        try:
+            del sbm.simulation.context
+        except Exception:
+            pass
+        sbm.simulation = None
     sbm.loaded = False
     sbm.temperature = temperature_K
     sbm.dt = timestep_ps
