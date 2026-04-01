@@ -544,16 +544,11 @@ def run_openmm_simulation(sbm, temperature_K, output_dir,
 
     print(f'\n  Running T = {temperature_K:.0f} K ...')
 
-    integrator = LangevinMiddleIntegrator(
-        temperature_K * unit.kelvin,
-        friction / unit.picosecond,
-        timestep_ps * unit.picoseconds
-    )
+    integrator = LangevinMiddleIntegrator(temperature_K * unit.kelvin, friction / unit.picosecond, timestep_ps * unit.picoseconds)
 
     sbm.createSimulation(integrator)
     sbm.simulation.context.setPositions(sbm.positions)
-    sbm.simulation.context.setVelocitiesToTemperature(
-        temperature_K * unit.kelvin)
+    sbm.simulation.context.setVelocitiesToTemperature(temperature_K * unit.kelvin)
 
     sbm.simulation.minimizeEnergy()
 
