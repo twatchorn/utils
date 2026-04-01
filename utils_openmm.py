@@ -507,14 +507,35 @@ def wham(wrkdir, csv_files, tlow, thigh, n_bins=50, max_iter=1000, tol=1e-8):
 
 # ── OPENMM SIMULATION RUNNER ──────────────────────────────────────────────────
 
-import types
-
 def run_openmm_simulation(sbm, temperature_K, output_dir,
                           n_steps=5_000_000, report_interval=1000,
                           timestep_ps=0.0005, friction=1.0,
                           platform='CPU'):
-    from openmm.app import DCDReporter, StateDataReporter
-    import openmm.unit as unit
+    """
+    Run a single OpenMM/OpenSMOG simulation at a given temperature.
+    Creates a fresh integrator each call so temperatures are independent.
+
+    Parameters
+    ----------
+    sbm            : OpenSMOG SBM object (already loaded with system)
+    temperature_K  : float — simulation temperature in Kelvin
+    output_dir     : str — directory to write DCD + CSV
+    n_steps        : int
+    report_interval: int
+    timestep_ps    : float — timestep in picoseconds
+    friction       : float — friction coefficient in 1/ps
+    platform       : str — 'CPU' | 'CUDA' | 'OpenCL'
+
+    Returns
+    -------
+    dcd_file, csv_file : str paths
+    """
+    try:
+        from openmm import LangevinMiddleIntegrator
+        from openmm.app import DCDReporter, StateDataReporter
+        import openmm.unit as unit
+    except ImportError:
+        raise ImportError('openmm not installed — run: pip install openmm')
 
     os.makedirs(output_dir, exist_ok=True)
     tag      = f"T{temperature_K:.0f}"
@@ -523,16 +544,19 @@ def run_openmm_simulation(sbm, temperature_K, output_dir,
 
     print(f'\n  Running T = {temperature_K:.0f} K ...')
 
-    # Reset SBM state for fresh context each temperature
-    sbm.loaded      = False
-    sbm.temperature = temperature_K
-    sbm.dt          = timestep_ps
-    sbm.gamma       = friction
-    sbm.setup_openmm(platform=platform, precision='single')
-    sbm.createSimulation()   # handles positions + velocities internally
-    sbm.minimize()
+    integrator = LangevinMiddleIntegrator(
+        temperature_K * unit.kelvin,
+        friction / unit.picosecond,
+        timestep_ps * unit.picoseconds
+    )
 
-    sbm.simulation.reporters.clear()
+    sbm.createSimulation(integrator)
+    sbm.simulation.context.setPositions(sbm.positions)
+    sbm.simulation.context.setVelocitiesToTemperature(
+        temperature_K * unit.kelvin)
+
+    sbm.simulation.minimizeEnergy()
+
     sbm.simulation.reporters.append(DCDReporter(dcd_file, report_interval))
     sbm.simulation.reporters.append(
         StateDataReporter(
@@ -551,6 +575,20 @@ def run_openmm_simulation(sbm, temperature_K, output_dir,
 def run_temperature_screen(sbm, temperatures, output_dir,
                            n_steps=5_000_000, report_interval=1000,
                            timestep_ps=0.0005, friction=1.0, platform='CPU'):
+    """
+    Run independent simulations across a list of temperatures.
+
+    Parameters
+    ----------
+    sbm          : OpenSMOG SBM object
+    temperatures : list/array of float — temperatures in Kelvin
+    output_dir   : str
+    ...          : forwarded to run_openmm_simulation
+
+    Returns
+    -------
+    summary : pd.DataFrame with columns [temperature_K, dcd, csv]
+    """
     results = []
     for T in temperatures:
         dcd, csv = run_openmm_simulation(
@@ -565,11 +603,6 @@ def run_temperature_screen(sbm, temperatures, output_dir,
     print(f'\nScreen complete. {len(results)} simulations finished.')
     return summary
 
-# Patch into the already-imported utils module so calls to utils.run_temperature_screen use the fix
-utils.run_openmm_simulation  = run_openmm_simulation
-utils.run_temperature_screen = run_temperature_screen
-
-print("✓ utils functions patched in-memory — re-run Stage 1")
 
 # ── FULL ANALYSIS RUN (OPENMM) ────────────────────────────────────────────────
 
