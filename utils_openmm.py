@@ -460,7 +460,7 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000, rep
     sbm.temperature = temperature_K
     sbm.dt = timestep_ps
     sbm.gamma = friction
-    sbm.setup_openmm(platform=platform, precision='single')
+    sbm.setup_openmm(platform=platform, precision='single', integrator='lengevinMiddle')
     sbm.createSimulation()
     sbm.minimize()
 
