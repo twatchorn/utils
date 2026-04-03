@@ -433,60 +433,103 @@ def wham(wrkdir, csv_files, tlow, thigh, n_bins=50, max_iter=1000, tol=1e-8):
 
 # ── OPENMM SIMULATION RUNNER (OpenSMOG 1.2) ──────────────────────────────────
 
-def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000, report_interval=1000, timestep_ps=0.0005, friction=1.0, platform='CPU'):
+def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
+                          report_interval=1000, timestep_ps=0.0005,
+                          friction=1.0, platform='CPU'):
     """
-    Run a single OpenSMOG 1.2 simulation at a given temperature.
+    Run a single simulation at a given temperature.
 
-    OpenSMOG 1.2 manages the integrator internally. Temperature, timestep and
-    friction are set on the SBM object. sbm.loaded is reset to False each call
-    so a fresh context is created for every temperature.
+    Works with both a raw OpenSMOG SBM object and the pure-OpenMM SBMAdapter
+    returned by build_sbm(). In either case a fresh integrator and context are
+    created for each temperature so there is no state bleed between runs.
     """
     from openmm.app import DCDReporter, StateDataReporter
+    from openmm import LangevinMiddleIntegrator, Platform, Vec3
     import openmm.unit as unit
+    import gc
 
     os.makedirs(output_dir, exist_ok=True)
-    tag = f"T{temperature_K:.0f}"
+    tag      = f"T{temperature_K:.0f}"
     dcd_file = os.path.join(output_dir, f"traj_{tag}.dcd")
     csv_file = os.path.join(output_dir, f"energy_{tag}.csv")
 
     print(f'\n  Running T = {temperature_K:.0f} K ...')
+
+    # ── Tear down any existing context to free GPU/CPU memory ────────────────
     if hasattr(sbm, 'simulation') and sbm.simulation is not None:
         try:
+            sbm.simulation.reporters.clear()
             del sbm.simulation.context
         except Exception:
             pass
         sbm.simulation = None
-    sbm.loaded = False
-    sbm.temperature = temperature_K
-    sbm.dt = timestep_ps
-    sbm.gamma = friction
-    sbm.setup_openmm(platform=platform, precision='single', integrator='lengevinMiddle')
-    sbm.createSimulation()
-    sbm.minimize()
+    gc.collect()
 
+    # ── Detect whether this is an SBMAdapter or a raw OpenSMOG SBM ──────────
+    if hasattr(sbm, '_is_adapter'):
+        # Pure-OpenMM path -- rebuild context from stored system + topology
+        box_vec  = sbm._box_vec
+        integrator = LangevinMiddleIntegrator(
+            temperature_K * unit.kelvin,
+            friction / unit.picosecond,
+            timestep_ps * unit.picoseconds)
+        plat = Platform.getPlatformByName(platform)
+        from openmm.app import Simulation
+        sim = Simulation(sbm.topology, sbm.system, integrator, plat)
+        sim.context.setPositions(sbm._init_positions)
+        sim.context.setPeriodicBoxVectors(*box_vec)
+        sim.minimizeEnergy()
+        # Centre COM
+        import numpy as np
+        state = sim.context.getState(getPositions=True)
+        pos   = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+        bx    = box_vec[0][0].value_in_unit(unit.nanometer)
+        com   = pos.mean(axis=0)
+        pos_c = pos - com + np.array([bx/2]*3)
+        sim.context.setPositions(pos_c * unit.nanometer)
+        sim.context.setPeriodicBoxVectors(*box_vec)
+        sbm.simulation = sim
+
+    else:
+        # OpenSMOG path -- use its native rebuild cycle
+        sbm.loaded      = False
+        sbm.temperature = temperature_K
+        sbm.dt          = timestep_ps
+        sbm.gamma       = friction
+        sbm.setup_openmm(platform=platform, precision='single',
+                         integrator='lengevinMiddle')
+        sbm.createSimulation()
+        sbm.minimize()
+
+    # ── Reporters + run ──────────────────────────────────────────────────────
     sbm.simulation.reporters.clear()
     sbm.simulation.reporters.append(DCDReporter(dcd_file, report_interval))
-    sbm.simulation.reporters.append(StateDataReporter(csv_file, report_interval, step=True, time=True, potentialEnergy=True, temperature=True, separator=','))
+    sbm.simulation.reporters.append(
+        StateDataReporter(csv_file, report_interval,
+                          step=True, time=True, potentialEnergy=True,
+                          temperature=True, separator=','))
 
     sbm.simulation.step(n_steps)
     print(f'  Done -> {dcd_file}')
     return dcd_file, csv_file
 
 
-def run_temperature_screen(sbm, temperatures, output_dir, n_steps=5_000_000, report_interval=1000, timestep_ps=0.0005, friction=1.0, platform='CPU'):
+def run_temperature_screen(sbm, temperatures, output_dir, n_steps=5_000_000,
+                           report_interval=1000, timestep_ps=0.0005,
+                           friction=1.0, platform='CPU'):
     """Run independent simulations across a list of temperatures."""
     results = []
     for T in temperatures:
-        dcd, csv = run_openmm_simulation(sbm, T, output_dir, n_steps=n_steps, report_interval=report_interval, timestep_ps=timestep_ps, friction=friction, platform=platform)
+        dcd, csv = run_openmm_simulation(
+            sbm, T, output_dir,
+            n_steps=n_steps, report_interval=report_interval,
+            timestep_ps=timestep_ps, friction=friction, platform=platform)
         results.append({'temperature_K': T, 'dcd': dcd, 'csv': csv})
 
     summary = pd.DataFrame(results)
     summary.to_csv(os.path.join(output_dir, 'simulation_index.csv'), index=False)
     print(f'\nScreen complete. {len(results)} simulations finished.')
     return summary
-
-
-# ── FULL ANALYSIS RUN ─────────────────────────────────────────────────────────
 
 def run_analysis(wrkdir, top_file, cont_file, cut_off, tlow, thigh):
     """Run complete analysis pipeline over all temperature simulations."""
