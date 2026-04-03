@@ -247,7 +247,16 @@ def bimodal_check(wrkdir, csv_files, plot=True):
             temp = None
 
         log(wrkdir, f'  T={temp}K | {len(data)} frames')
-        counts, bin_edges = np.histogram(data, bins=50, density=True)
+
+        # Skip temperatures with too few frames for a meaningful histogram
+        MIN_FRAMES = 50
+        if len(data) < MIN_FRAMES:
+            log(wrkdir, f'  Skipping T={temp}K -- fewer than {MIN_FRAMES} frames (NaN run?)')
+            results.append({'file': file, 'temp': temp, 'is_bimodal': False})
+            continue
+
+        n_bins = min(50, max(10, len(data) // 5))
+        counts, bin_edges = np.histogram(data, bins=n_bins, density=True)
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
         max_left_idx = int(np.argmax(counts))
         max_right_idx = int(len(counts) - 1 - np.argmax(counts[::-1]))
