@@ -242,16 +242,17 @@ def bimodal_check(wrkdir, csv_files, plot=True):
         data = df[energy_col[0]].dropna().values
         stem = pathlib.Path(file).stem
         try:
-            temp = float(''.join(c for c in stem.split('_')[1] if c.isdigit() or c == '.'))
+            temp_tag = stem.split('_')[1].lstrip('T')
+            temp = float(temp_tag)
         except (IndexError, ValueError):
             temp = None
 
-        log(wrkdir, f'  T={temp}K | {len(data)} frames')
+        log(wrkdir, f'  T={temp} | {len(data)} frames')
 
         # Skip temperatures with too few frames for a meaningful histogram
         MIN_FRAMES = 50
         if len(data) < MIN_FRAMES:
-            log(wrkdir, f'  Skipping T={temp}K -- fewer than {MIN_FRAMES} frames (NaN run?)')
+            log(wrkdir, f'  Skipping T={temp} -- fewer than {MIN_FRAMES} frames (NaN run?)')
             results.append({'file': file, 'temp': temp, 'is_bimodal': False})
             continue
 
@@ -271,7 +272,7 @@ def bimodal_check(wrkdir, csv_files, plot=True):
 
         if is_bimodal and best_temp is None:
             best_temp = temp
-            log(wrkdir, f'  *** Bimodal detected — preliminary Tf: {temp} K ***')
+            log(wrkdir, f'  *** Bimodal detected — preliminary Tf: {temp} ***')
 
         results.append({'file': file, 'temp': temp, 'is_bimodal': is_bimodal})
 
@@ -284,7 +285,7 @@ def bimodal_check(wrkdir, csv_files, plot=True):
                 ax.axvline(bin_centers[max_right_idx], color='navy', linestyle='--', linewidth=1, label='Peak R')
             ax.set_xlabel('Potential Energy (kJ/mol)')
             ax.set_ylabel('Density')
-            ax.set_title(f'PE Histogram T={temp}K' + (' [BIMODAL]' if is_bimodal else ''))
+            ax.set_title(f'PE Histogram T={temp}' + (' [BIMODAL]' if is_bimodal else ''))
             ax.legend(fontsize=8)
             plt.tight_layout()
             plt.savefig(f'{wrkdir}/MDOutputFiles/PE_hist_T{temp}.png', dpi=150)
@@ -337,7 +338,8 @@ def wham(wrkdir, csv_files, tlow, thigh, n_bins=50, max_iter=1000, tol=1e-8):
     for file in sorted(csv_files):
         stem = pathlib.Path(file).stem
         try:
-            temp = float(''.join(c for c in stem.split('_')[1] if c.isdigit() or c == '.'))
+            temp_tag = stem.split('_')[1].lstrip('T')
+            temp = float(temp_tag)
         except (IndexError, ValueError):
             try:
                 temp = float(''.join(c for c in stem if c.isdigit() or c == '.'))
@@ -458,11 +460,27 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
     import gc
 
     os.makedirs(output_dir, exist_ok=True)
-    tag      = f"T{temperature_K:.0f}"
+
+    # Convert reduced unit temperature to real Kelvin for OpenMM integrator.
+    # Reduced unit: T* = T_real * kB / epsilon
+    # Real Kelvin : T_real = T* * epsilon / kB
+    # epsilon comes from sbm._epsilon if set by build_sbm, else assume 3.0 kJ/mol
+    _kB      = 0.008314   # kJ/mol/K
+    _epsilon = getattr(sbm, '_epsilon', 3.0)
+    if temperature_K < 10.0:
+        # Looks like a reduced unit temperature -- convert to Kelvin
+        temperature_K_real = temperature_K * _epsilon / _kB
+    else:
+        # Already in Kelvin
+        temperature_K_real = temperature_K
+
+    # Use enough decimal places to distinguish reduced-unit temperatures
+    _t_str   = f"{temperature_K:.4f}".rstrip('0').rstrip('.')
+    tag      = f"T{_t_str}"
     dcd_file = os.path.join(output_dir, f"traj_{tag}.dcd")
     csv_file = os.path.join(output_dir, f"energy_{tag}.csv")
 
-    print(f'\n  Running T = {temperature_K:.0f} K ...')
+    print(f'\n  Running T* = {temperature_K} (T = {temperature_K_real:.1f} K) ...')
 
     # ── Tear down any existing context to free GPU/CPU memory ────────────────
     if hasattr(sbm, 'simulation') and sbm.simulation is not None:
@@ -479,7 +497,7 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
         # Pure-OpenMM path -- rebuild context from stored system + topology
         box_vec  = sbm._box_vec
         integrator = LangevinMiddleIntegrator(
-            temperature_K * unit.kelvin,
+            temperature_K_real * unit.kelvin,
             friction / unit.picosecond,
             timestep_ps * unit.picoseconds)
         plat = Platform.getPlatformByName(platform)
@@ -499,13 +517,13 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
         sim.context.setPeriodicBoxVectors(*box_vec)
         # Initialise velocities from Maxwell-Boltzmann so particles don't
         # start from rest and cause force spikes on the first step
-        sim.context.setVelocitiesToTemperature(temperature_K * unit.kelvin)
+        sim.context.setVelocitiesToTemperature(temperature_K_real * unit.kelvin)
         sbm.simulation = sim
 
     else:
         # OpenSMOG path -- use its native rebuild cycle
         sbm.loaded      = False
-        sbm.temperature = temperature_K
+        sbm.temperature = temperature_K_real
         sbm.dt          = timestep_ps
         sbm.gamma       = friction
         sbm.setup_openmm(platform=platform, precision='single',
@@ -526,7 +544,7 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
     except Exception as exc:
         msg = str(exc)
         if 'NaN' in msg or 'nan' in msg.lower():
-            print(f'  WARNING: NaN detected mid-run at T={temperature_K:.0f} K.')
+            print(f'  WARNING: NaN detected mid-run at T*={temperature_K} (T={temperature_K_real:.1f} K).')
             print(f'  This usually means the timestep is too large for this temperature.')
             print(f'  Partial trajectory saved to {dcd_file} (may be incomplete).')
             print(f'  Consider reducing TIMESTEP or lowering force constants.')
