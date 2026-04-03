@@ -483,11 +483,14 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
         import numpy as np
         state = sim.context.getState(getPositions=True)
         pos   = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-        bx    = box_vec[0][0].value_in_unit(unit.nanometer)
+        bx    = float(box_vec[0][0])   # Vec3 components are plain floats in nm
         com   = pos.mean(axis=0)
         pos_c = pos - com + np.array([bx/2]*3)
         sim.context.setPositions(pos_c * unit.nanometer)
         sim.context.setPeriodicBoxVectors(*box_vec)
+        # Initialise velocities from Maxwell-Boltzmann so particles don't
+        # start from rest and cause force spikes on the first step
+        sim.context.setVelocitiesToTemperature(temperature_K * unit.kelvin)
         sbm.simulation = sim
 
     else:
@@ -509,7 +512,17 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
                           step=True, time=True, potentialEnergy=True,
                           temperature=True, separator=','))
 
-    sbm.simulation.step(n_steps)
+    try:
+        sbm.simulation.step(n_steps)
+    except Exception as exc:
+        msg = str(exc)
+        if 'NaN' in msg or 'nan' in msg.lower():
+            print(f'  WARNING: NaN detected mid-run at T={temperature_K:.0f} K.')
+            print(f'  This usually means the timestep is too large for this temperature.')
+            print(f'  Partial trajectory saved to {dcd_file} (may be incomplete).')
+            print(f'  Consider reducing TIMESTEP or lowering force constants.')
+        else:
+            raise
     print(f'  Done -> {dcd_file}')
     return dcd_file, csv_file
 
