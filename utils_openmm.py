@@ -500,6 +500,7 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
             temperature_K_real * unit.kelvin,
             friction / unit.picosecond,
             timestep_ps * unit.picoseconds)
+        integrator.setConstraintTolerance(1e-5)
         plat = Platform.getPlatformByName(platform)
         from openmm.app import Simulation
         sim = Simulation(sbm.topology, sbm.system, integrator, plat)
@@ -515,8 +516,11 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
         pos_c = pos - com + np.array([bx/2]*3)
         sim.context.setPositions(pos_c * unit.nanometer)
         sim.context.setPeriodicBoxVectors(*box_vec)
-        # Initialise velocities from Maxwell-Boltzmann so particles don't
-        # start from rest and cause force spikes on the first step
+        # Gentle velocity init: start at 10% of target, equilibrate 1000 steps,
+        # then ramp to full temperature. Prevents force spikes with stiff constraints.
+        _init_temp = max(1.0, temperature_K_real * 0.1)
+        sim.context.setVelocitiesToTemperature(_init_temp * unit.kelvin)
+        sim.step(1000)   # short equilibration at low temp
         sim.context.setVelocitiesToTemperature(temperature_K_real * unit.kelvin)
         sbm.simulation = sim
 
