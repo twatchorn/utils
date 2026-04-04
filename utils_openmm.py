@@ -1,6 +1,6 @@
 """
 utils_openmm.py — GO-Model Analysis Utilities (OpenMM / OpenSMOG 1.2)
-Roche Lab | Iowa State University
+Trevor Watchorn | Roche Lab | Iowa State University
 
 Analysis and simulation functions for GO-model folding landscape generation
 using OpenMM/OpenSMOG output. Expects: .dcd trajectories + StateDataReporter CSVs.
