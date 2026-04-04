@@ -543,18 +543,43 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
                           step=True, time=True, potentialEnergy=True,
                           temperature=True, separator=','))
 
-    try:
-        sbm.simulation.step(n_steps)
-    except Exception as exc:
-        msg = str(exc)
-        if 'NaN' in msg or 'nan' in msg.lower():
-            print(f'  WARNING: NaN detected mid-run at T*={temperature_K} (T={temperature_K_real:.1f} K).')
-            print(f'  This usually means the timestep is too large for this temperature.')
-            print(f'  Partial trajectory saved to {dcd_file} (may be incomplete).')
-            print(f'  Consider reducing TIMESTEP or lowering force constants.')
-        else:
-            raise
-    print(f'  Done -> {dcd_file}')
+    # Run with auto-restart on NaN -- up to MAX_RESTARTS attempts with fresh
+    # velocity draws. NaN from unlucky initial velocities is stochastic and
+    # usually resolves within 1-2 restarts.
+    MAX_RESTARTS = 5
+    steps_done   = 0
+    restart      = 0
+
+    while steps_done < n_steps and restart <= MAX_RESTARTS:
+        steps_left = n_steps - steps_done
+        try:
+            sbm.simulation.step(steps_left)
+            steps_done = n_steps   # completed cleanly
+        except Exception as exc:
+            msg = str(exc)
+            if 'NaN' in msg or 'nan' in msg.lower():
+                restart += 1
+                if restart > MAX_RESTARTS:
+                    print(f'  WARNING: NaN after {MAX_RESTARTS} restarts at '
+                          f'T*={temperature_K} (T={temperature_K_real:.1f} K). '
+                          f'Saving partial trajectory.')
+                    break
+                print(f'  NaN detected -- restart {restart}/{MAX_RESTARTS} '
+                      f'with fresh velocities...')
+                # Reset positions to minimized start, reseed velocities
+                sbm.simulation.context.setPositions(sbm._init_positions)
+                sbm.simulation.context.setPeriodicBoxVectors(*box_vec)
+                sbm.simulation.context.setVelocitiesToTemperature(
+                    temperature_K_real * unit.kelvin)
+                sbm.simulation.step(1000)   # re-equilibrate
+                sbm.simulation.context.setVelocitiesToTemperature(
+                    temperature_K_real * unit.kelvin)
+                # Don't reset steps_done -- count frames already written
+                steps_done = sbm.simulation.currentStep
+            else:
+                raise
+
+    print(f'  Done -> {dcd_file}  ({sbm.simulation.currentStep} steps)')
     return dcd_file, csv_file
 
 
