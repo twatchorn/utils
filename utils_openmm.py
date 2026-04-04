@@ -1,6 +1,6 @@
 """
 utils_openmm.py — GO-Model Analysis Utilities (OpenMM / OpenSMOG 1.2)
-Trevor Watchorn | Roche Lab | Iowa State University
+Roche Lab | Iowa State University
 
 Analysis and simulation functions for GO-model folding landscape generation
 using OpenMM/OpenSMOG output. Expects: .dcd trajectories + StateDataReporter CSVs.
@@ -546,15 +546,20 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
     # Run with auto-restart on NaN -- up to MAX_RESTARTS attempts with fresh
     # velocity draws. NaN from unlucky initial velocities is stochastic and
     # usually resolves within 1-2 restarts.
-    MAX_RESTARTS = 5
-    steps_done   = 0
-    restart      = 0
+    # NOTE: we track steps manually because simulation.currentStep keeps
+    # incrementing even after position resets and can't be used to measure
+    # progress toward n_steps.
+    MAX_RESTARTS  = 5
+    steps_done    = 0
+    restart       = 0
+    CHUNK         = min(100_000, n_steps)  # run in chunks to catch NaN early
 
     while steps_done < n_steps and restart <= MAX_RESTARTS:
-        steps_left = n_steps - steps_done
+        steps_left  = n_steps - steps_done
+        steps_this  = min(CHUNK, steps_left)
         try:
-            sbm.simulation.step(steps_left)
-            steps_done = n_steps   # completed cleanly
+            sbm.simulation.step(steps_this)
+            steps_done += steps_this
         except Exception as exc:
             msg = str(exc)
             if 'NaN' in msg or 'nan' in msg.lower():
@@ -562,24 +567,25 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
                 if restart > MAX_RESTARTS:
                     print(f'  WARNING: NaN after {MAX_RESTARTS} restarts at '
                           f'T*={temperature_K} (T={temperature_K_real:.1f} K). '
-                          f'Saving partial trajectory.')
+                          f'Saving partial trajectory ({steps_done:,} steps).')
                     break
-                print(f'  NaN detected -- restart {restart}/{MAX_RESTARTS} '
-                      f'with fresh velocities...')
+                print(f'  NaN at step {steps_done:,} -- '
+                      f'restart {restart}/{MAX_RESTARTS} with fresh velocities...')
                 # Reset positions to minimized start, reseed velocities
                 sbm.simulation.context.setPositions(sbm._init_positions)
                 sbm.simulation.context.setPeriodicBoxVectors(*box_vec)
+                _init_temp = max(1.0, temperature_K_real * 0.1)
                 sbm.simulation.context.setVelocitiesToTemperature(
-                    temperature_K_real * unit.kelvin)
+                    _init_temp * unit.kelvin)
                 sbm.simulation.step(1000)   # re-equilibrate
                 sbm.simulation.context.setVelocitiesToTemperature(
                     temperature_K_real * unit.kelvin)
-                # Don't reset steps_done -- count frames already written
-                steps_done = sbm.simulation.currentStep
+                # steps_done intentionally NOT reset -- keep frames already written
             else:
                 raise
 
-    print(f'  Done -> {dcd_file}  ({sbm.simulation.currentStep} steps)')
+    frames_written = steps_done // REPORT_INTERVAL
+    print(f'  Done -> {dcd_file}  ({steps_done:,} steps, ~{frames_written:,} frames)')
     return dcd_file, csv_file
 
 
@@ -639,3 +645,4 @@ def run_analysis(wrkdir, top_file, cont_file, cut_off, tlow, thigh):
     log(wrkdir, '=' * 60)
 
     return all_results, wham_results
+
