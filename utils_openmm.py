@@ -584,7 +584,7 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
             else:
                 raise
 
-    frames_written = steps_done // REPORT_INTERVAL
+    frames_written = steps_done // report_interval
     print(f'  Done -> {dcd_file}  ({steps_done:,} steps, ~{frames_written:,} frames)')
     return dcd_file, csv_file
 
