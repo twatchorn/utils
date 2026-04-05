@@ -543,9 +543,13 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
         StateDataReporter(csv_file, report_interval,
                           step=True, time=True, potentialEnergy=True,
                           temperature=True, separator=','))
-    sbm.simulation.reporters.append(StateDataReporter(sys.stdout, 10000, step=True,potentialEnergy=True,kineticEnergy=True,
-                                    totalEnergy=True,temperature=True,progress=True,remainingTime=True,
-                                    speed=True,      totalSteps=n_steps))
+    sbm.simulation.reporters.append(
+        StateDataReporter(sys.stdout, report_interval * 10,
+                          step=True, potentialEnergy=True,
+                          kineticEnergy=True, totalEnergy=True,
+                          temperature=True, progress=True,
+                          remainingTime=True, speed=True,
+                          totalSteps=n_steps, separator=','))
 
     # Run with auto-restart on NaN -- up to MAX_RESTARTS attempts with fresh
     # velocity draws. NaN from unlucky initial velocities is stochastic and
