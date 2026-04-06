@@ -571,9 +571,9 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
                           temperature=True, separator=','))
     sbm.simulation.reporters.append(
         StateDataReporter(sys.stdout, report_interval * 10,
-                          step=True, potentialEnergy=True,
-                          kineticEnergy=True, totalEnergy=True,
-                          temperature=True, progress=True,
+                          step=True, potentialEnergy=False,
+                          kineticEnergy=False, totalEnergy=False,
+                          temperature=False, progress=True,
                           remainingTime=True, speed=True,
                           totalSteps=n_steps, separator=','))
     # Checkpoint every 100k steps -- survives Colab runtime drops
