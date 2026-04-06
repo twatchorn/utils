@@ -445,45 +445,81 @@ def wham(wrkdir, csv_files, tlow, thigh, n_bins=50, max_iter=1000, tol=1e-8):
 
 # ── OPENMM SIMULATION RUNNER (OpenSMOG 1.2) ──────────────────────────────────
 
+def _expected_frames(n_steps, report_interval):
+    """Expected number of frames for a complete simulation."""
+    return n_steps // report_interval
+
+
+def _dcd_frame_count(dcd_path, top_path):
+    """Count frames in a DCD file. Returns 0 if file missing or corrupt."""
+    try:
+        import mdtraj as md
+        t = md.load(dcd_path, top=top_path)
+        return t.n_frames
+    except Exception:
+        return 0
+
+
+def _is_complete(dcd_path, top_path, n_steps, report_interval, tolerance=0.95):
+    """
+    Check if a DCD trajectory represents a complete simulation.
+    Allows tolerance fraction of expected frames to account for
+    NaN restarts that lost a small number of frames.
+    """
+    expected = _expected_frames(n_steps, report_interval)
+    actual   = _dcd_frame_count(dcd_path, top_path)
+    complete = actual >= int(expected * tolerance)
+    return complete, actual, expected
+
+
 def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
                           report_interval=1000, timestep_ps=0.0005,
                           friction=1.0, platform='CPU'):
     """
     Run a single simulation at a given temperature.
 
-    Works with both a raw OpenSMOG SBM object and the pure-OpenMM SBMAdapter
-    returned by build_sbm(). In either case a fresh integrator and context are
-    created for each temperature so there is no state bleed between runs.
+    Features:
+    - Skips if a complete trajectory already exists (Drive persistence)
+    - Resumes from OpenMM checkpoint if partial trajectory + checkpoint exist
+    - Saves checkpoints every 100k steps for runtime-drop recovery
+    - Auto-restarts on NaN with fresh velocity draws
     """
-    from openmm.app import DCDReporter, StateDataReporter
+    from openmm.app import DCDReporter, StateDataReporter, CheckpointReporter
     from openmm import LangevinMiddleIntegrator, Platform, Vec3
     import openmm.unit as unit
-    import gc
+    import gc, sys
 
     os.makedirs(output_dir, exist_ok=True)
-
-    # Convert reduced unit temperature to real Kelvin for OpenMM integrator.
-    # Reduced unit: T* = T_real * kB / epsilon
-    # Real Kelvin : T_real = T* * epsilon / kB
-    # epsilon comes from sbm._epsilon if set by build_sbm, else assume 3.0 kJ/mol
-    _kB      = 0.008314   # kJ/mol/K
-    _epsilon = getattr(sbm, '_epsilon', 3.0)
-    if temperature_K < 10.0:
-        # Looks like a reduced unit temperature -- convert to Kelvin
-        temperature_K_real = temperature_K * _epsilon / _kB
-    else:
-        # Already in Kelvin
-        temperature_K_real = temperature_K
-
-    # Use enough decimal places to distinguish reduced-unit temperatures
     _t_str   = f"{temperature_K:.4f}".rstrip('0').rstrip('.')
     tag      = f"T{_t_str}"
     dcd_file = os.path.join(output_dir, f"traj_{tag}.dcd")
     csv_file = os.path.join(output_dir, f"energy_{tag}.csv")
+    chk_file = os.path.join(output_dir, f"checkpoint_{tag}.chk")
+    top_path = getattr(sbm, '_ca_pdb', None)
+
+    # ── Completion check -- skip if already done ──────────────────────────────
+    if top_path and os.path.exists(dcd_file):
+        complete, actual, expected = _is_complete(
+            dcd_file, top_path, n_steps, report_interval)
+        if complete:
+            print(f'\n  T* = {temperature_K} -- trajectory already complete '
+                  f'({actual:,}/{expected:,} frames). Skipping.')
+            return dcd_file, csv_file
+        else:
+            print(f'\n  T* = {temperature_K} -- partial trajectory found '
+                  f'({actual:,}/{expected:,} frames).')
+
+    # ── Convert reduced temperature to Kelvin ─────────────────────────────────
+    _kB      = 0.008314
+    _epsilon = getattr(sbm, '_epsilon', 3.0)
+    if temperature_K < 10.0:
+        temperature_K_real = temperature_K * _epsilon / _kB
+    else:
+        temperature_K_real = temperature_K
 
     print(f'\n  Running T* = {temperature_K} (T = {temperature_K_real:.1f} K) ...')
 
-    # ── Tear down any existing context to free GPU/CPU memory ────────────────
+    # ── Tear down existing context ────────────────────────────────────────────
     if hasattr(sbm, 'simulation') and sbm.simulation is not None:
         try:
             sbm.simulation.reporters.clear()
@@ -493,10 +529,10 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
         sbm.simulation = None
     gc.collect()
 
-    # ── Detect whether this is an SBMAdapter or a raw OpenSMOG SBM ──────────
+    # ── Build simulation ──────────────────────────────────────────────────────
+    steps_done = 0
     if hasattr(sbm, '_is_adapter'):
-        # Pure-OpenMM path -- rebuild context from stored system + topology
-        box_vec  = sbm._box_vec
+        box_vec    = sbm._box_vec
         integrator = LangevinMiddleIntegrator(
             temperature_K_real * unit.kelvin,
             friction / unit.picosecond,
@@ -507,26 +543,42 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
         sim = Simulation(sbm.topology, sbm.system, integrator, plat)
         sim.context.setPositions(sbm._init_positions)
         sim.context.setPeriodicBoxVectors(*box_vec)
-        sim.minimizeEnergy()
-        # Centre COM
-        import numpy as np
-        state = sim.context.getState(getPositions=True)
-        pos   = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-        bx    = float(box_vec[0][0])   # Vec3 components are plain floats in nm
-        com   = pos.mean(axis=0)
-        pos_c = pos - com + np.array([bx/2]*3)
-        sim.context.setPositions(pos_c * unit.nanometer)
-        sim.context.setPeriodicBoxVectors(*box_vec)
-        # Gentle velocity init: start at 10% of target, equilibrate 1000 steps,
-        # then ramp to full temperature. Prevents force spikes with stiff constraints.
-        _init_temp = max(1.0, temperature_K_real * 0.1)
-        sim.context.setVelocitiesToTemperature(_init_temp * unit.kelvin)
-        sim.step(1000)   # short equilibration at low temp
-        sim.context.setVelocitiesToTemperature(temperature_K_real * unit.kelvin)
+
+        # ── Resume from checkpoint if available ───────────────────────────────
+        if os.path.exists(chk_file) and os.path.exists(dcd_file):
+            try:
+                sim.loadCheckpoint(chk_file)
+                if os.path.exists(csv_file):
+                    try:
+                        _df      = pd.read_csv(csv_file)
+                        steps_done = int(_df['Step'].iloc[-1])
+                        print(f'  Resuming from checkpoint at step {steps_done:,} '
+                              f'({steps_done * timestep_ps / 1000:.2f} ns completed)')
+                    except Exception:
+                        steps_done = 0
+            except Exception as e:
+                print(f'  Checkpoint load failed ({e}) -- starting fresh')
+                steps_done = 0
+                sim.context.setPositions(sbm._init_positions)
+                sim.context.setPeriodicBoxVectors(*box_vec)
+
+        if steps_done == 0:
+            sim.minimizeEnergy()
+            state = sim.context.getState(getPositions=True)
+            pos   = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+            bx    = float(box_vec[0][0])
+            com   = pos.mean(axis=0)
+            pos_c = pos - com + np.array([bx/2]*3)
+            sim.context.setPositions(pos_c * unit.nanometer)
+            sim.context.setPeriodicBoxVectors(*box_vec)
+            _init_temp = max(1.0, temperature_K_real * 0.1)
+            sim.context.setVelocitiesToTemperature(_init_temp * unit.kelvin)
+            sim.step(1000)
+            sim.context.setVelocitiesToTemperature(temperature_K_real * unit.kelvin)
+
         sbm.simulation = sim
 
     else:
-        # OpenSMOG path -- use its native rebuild cycle
         sbm.loaded      = False
         sbm.temperature = temperature_K_real
         sbm.dt          = timestep_ps
@@ -536,64 +588,59 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
         sbm.createSimulation()
         sbm.minimize()
 
-    # ── Reporters + run ──────────────────────────────────────────────────────
+    # ── Reporters ─────────────────────────────────────────────────────────────
+    n_remaining = n_steps - steps_done
     sbm.simulation.reporters.clear()
-    sbm.simulation.reporters.append(DCDReporter(dcd_file, report_interval))
+    _resuming = steps_done > 0 and os.path.exists(dcd_file)
+
+    sbm.simulation.reporters.append(
+        DCDReporter(dcd_file, report_interval, append=_resuming))
     sbm.simulation.reporters.append(
         StateDataReporter(csv_file, report_interval,
                           step=True, time=True, potentialEnergy=True,
-                          temperature=True, separator=','))
+                          temperature=True, separator=',',
+                          append=_resuming))
     sbm.simulation.reporters.append(
         StateDataReporter(sys.stdout, report_interval * 10,
-                          step=True, potentialEnergy=False,
-                          kineticEnergy=False, totalEnergy=False,
-                          temperature=False, progress=True,
+                          step=True, potentialEnergy=True,
+                          kineticEnergy=True, totalEnergy=True,
+                          temperature=True, progress=True,
                           remainingTime=True, speed=True,
                           totalSteps=n_steps, separator=','))
+    # Checkpoint every 100k steps -- persists to Drive automatically
+    sbm.simulation.reporters.append(
+        CheckpointReporter(chk_file, 100_000))
 
-    # Run with auto-restart on NaN -- up to MAX_RESTARTS attempts with fresh
-    # velocity draws. NaN from unlucky initial velocities is stochastic and
-    # usually resolves within 1-2 restarts.
-    # NOTE: we track steps manually because simulation.currentStep keeps
-    # incrementing even after position resets and can't be used to measure
-    # progress toward n_steps.
-    MAX_RESTARTS  = 5
-    steps_done    = 0
-    restart       = 0
-    CHUNK         = min(100_000, n_steps)  # run in chunks to catch NaN early
+    # ── Run with NaN restart logic ────────────────────────────────────────────
+    MAX_RESTARTS = 5
+    restart      = 0
 
-    while steps_done < n_steps and restart <= MAX_RESTARTS:
-        steps_left  = n_steps - steps_done
-        steps_this  = min(CHUNK, steps_left)
+    while restart <= MAX_RESTARTS:
         try:
-            sbm.simulation.step(steps_this)
-            steps_done += steps_this
+            sbm.simulation.step(n_remaining)
+            break
         except Exception as exc:
             msg = str(exc)
             if 'NaN' in msg or 'nan' in msg.lower():
                 restart += 1
                 if restart > MAX_RESTARTS:
                     print(f'  WARNING: NaN after {MAX_RESTARTS} restarts at '
-                          f'T*={temperature_K} (T={temperature_K_real:.1f} K). '
-                          f'Saving partial trajectory ({steps_done:,} steps).')
+                          f'T*={temperature_K}. Saving partial trajectory.')
                     break
-                print(f'  NaN at step {steps_done:,} -- '
-                      f'restart {restart}/{MAX_RESTARTS} with fresh velocities...')
-                # Reset positions to minimized start, reseed velocities
+                print(f'  NaN detected -- restart {restart}/{MAX_RESTARTS} '
+                      f'with fresh velocities...')
                 sbm.simulation.context.setPositions(sbm._init_positions)
-                sbm.simulation.context.setPeriodicBoxVectors(*box_vec)
+                sbm.simulation.context.setPeriodicBoxVectors(*sbm._box_vec)
                 _init_temp = max(1.0, temperature_K_real * 0.1)
                 sbm.simulation.context.setVelocitiesToTemperature(
                     _init_temp * unit.kelvin)
-                sbm.simulation.step(1000)   # re-equilibrate
+                sbm.simulation.step(1000)
                 sbm.simulation.context.setVelocitiesToTemperature(
                     temperature_K_real * unit.kelvin)
-                # steps_done intentionally NOT reset -- keep frames already written
             else:
                 raise
 
-    frames_written = steps_done // report_interval
-    print(f'  Done -> {dcd_file}  ({steps_done:,} steps, ~{frames_written:,} frames)')
+    print(f'  Done -> {dcd_file}')
     return dcd_file, csv_file
 
 
