@@ -470,9 +470,15 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
 
     # ── Completion check ─────────────────────────────────────────────────────
     expected_frames = int(n_steps / report_interval)
-    if os.path.exists(dcd_file) and os.path.exists(csv_file):
+    _dcd_exists = os.path.exists(dcd_file)
+    _csv_exists = os.path.exists(csv_file)
+    _chk_exists = os.path.exists(chk_file)
+    print(f'  Checking for existing files for T*={temperature_K}:')
+    print(f'    DCD: {_dcd_exists}  CSV: {_csv_exists}  CHK: {_chk_exists}')
+    print(f'    Expected frames: {expected_frames}')
+    if _dcd_exists and _csv_exists:
         try:
-            _df = pd.read_csv(csv_file)
+            _df = pd.read_csv(csv_file, comment=None)
             actual_frames = len(_df)
             if actual_frames >= int(expected_frames * 0.95):
                 print(f'  T* = {temperature_K} already complete '
@@ -486,8 +492,9 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
     resume     = False
     if os.path.exists(chk_file) and os.path.exists(csv_file):
         try:
-            _df        = pd.read_csv(csv_file)
-            steps_done = int(_df['Step'].iloc[-1]) if 'Step' in _df.columns else 0
+            _df        = pd.read_csv(csv_file, comment=None)
+            # OpenMM writes step column as '#"Step"' -- use position not name
+            steps_done = int(_df.iloc[-1, 0]) if len(_df) > 0 else 0
             if 0 < steps_done < n_steps:
                 resume = True
                 pct    = steps_done / n_steps * 100
@@ -571,9 +578,9 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
                           temperature=True, separator=','))
     sbm.simulation.reporters.append(
         StateDataReporter(sys.stdout, report_interval * 10,
-                          step=True, potentialEnergy=False,
-                          kineticEnergy=False, totalEnergy=False,
-                          temperature=False, progress=True,
+                          step=True, potentialEnergy=True,
+                          kineticEnergy=True, totalEnergy=True,
+                          temperature=True, progress=True,
                           remainingTime=True, speed=True,
                           totalSteps=n_steps, separator=','))
     # Checkpoint every 100k steps -- survives Colab runtime drops
