@@ -445,21 +445,134 @@ def wham(wrkdir, csv_files, tlow, thigh, n_bins=50, max_iter=1000, tol=1e-8):
 
 # ── OPENMM SIMULATION RUNNER (OpenSMOG 1.2) ──────────────────────────────────
 
+def _make_status_widget():
+    """Create and display a fixed status widget for simulation progress."""
+    from IPython.display import display
+    import ipywidgets as widgets
+
+    title = widgets.HTML(
+        value="<h3 style='margin:4px 0; color:#2c3e50;'>GRID Simulation Status</h3>")
+
+    temp_label = widgets.HTML(value="<b>Temperature:</b> --")
+    temp_num   = widgets.HTML(value="<b>Simulation:</b> -- of --")
+
+    progress_bar = widgets.IntProgress(
+        value=0, min=0, max=100,
+        style={'bar_color': '#27ae60'},
+        layout=widgets.Layout(width='100%', height='22px'))
+
+    progress_label = widgets.HTML(value="0%")
+
+    speed_label = widgets.HTML(value="<b>Speed:</b> --")
+    eta_label   = widgets.HTML(value="<b>ETA:</b> --")
+
+    status_row = widgets.HBox([speed_label, 
+                               widgets.HTML("&nbsp;&nbsp;&nbsp;"),
+                               eta_label])
+
+    box = widgets.VBox([
+        title,
+        widgets.HTML("<hr style='margin:4px 0; border-color:#ddd'>"),
+        temp_label,
+        temp_num,
+        widgets.HBox([progress_bar, 
+                      widgets.HTML("&nbsp;"),
+                      progress_label]),
+        status_row,
+        widgets.HTML("<hr style='margin:4px 0; border-color:#ddd'>"),
+    ], layout=widgets.Layout(
+        border='1px solid #ddd',
+        padding='10px',
+        border_radius='6px',
+        width='500px'))
+
+    display(box)
+
+    return {
+        'temp_label'   : temp_label,
+        'temp_num'     : temp_num,
+        'progress_bar' : progress_bar,
+        'progress_label': progress_label,
+        'speed_label'  : speed_label,
+        'eta_label'    : eta_label,
+    }
+
+
+def _update_status(widgets_dict, temp_K, temp_idx, n_temps,
+                   csv_file, n_steps, report_interval, timestep_ps):
+    """
+    Background thread target: polls CSV and updates status widget.
+    Runs until _stop_event is set.
+    """
+    import threading, time
+    _kB      = 0.008314
+    _epsilon = 3.0   # fallback, updated below if available
+
+    while not _update_status._stop.is_set():
+        try:
+            if os.path.exists(csv_file):
+                _df = pd.read_csv(csv_file, comment=None)
+                if len(_df) >= 2:
+                    frames_done  = len(_df)
+                    steps_done   = frames_done * report_interval
+                    pct          = min(100, int(steps_done / n_steps * 100))
+
+                    # Parse speed from last rows -- StateDataReporter
+                    # writes speed in ns/day as last column
+                    speed_val = '--'
+                    eta_val   = '--'
+                    try:
+                        # Speed column is typically the last one
+                        last_row = _df.iloc[-1]
+                        # Try to find speed column
+                        for col in _df.columns:
+                            if 'speed' in col.lower():
+                                spd = float(last_row[col])
+                                speed_val = f'{spd:.0f} ns/day'
+                                # ETA
+                                ns_done = steps_done * timestep_ps / 1000
+                                ns_total = n_steps * timestep_ps / 1000
+                                ns_left  = ns_total - ns_done
+                                if spd > 0:
+                                    hours = ns_left / spd * 24
+                                    if hours < 1:
+                                        eta_val = f'{hours*60:.0f} min'
+                                    else:
+                                        eta_val = f'{hours:.1f} hr'
+                                break
+                    except Exception:
+                        pass
+
+                    widgets_dict['progress_bar'].value   = pct
+                    widgets_dict['progress_label'].value = f'<b>{pct}%</b>'
+                    widgets_dict['speed_label'].value    = f'<b>Speed:</b> {speed_val}'
+                    widgets_dict['eta_label'].value      = f'<b>ETA:</b> {eta_val}'
+
+        except Exception:
+            pass
+
+        time.sleep(2)   # poll every 2 seconds
+
+
+_update_status._stop = None   # set per run
+
+
 def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
                           report_interval=1000, timestep_ps=0.0005,
-                          friction=1.0, platform='CPU'):
+                          friction=1.0, platform='CPU',
+                          widgets_dict=None, temp_idx=1, n_temps=1):
     """
     Run a single simulation at a given temperature.
     Features:
     - Completion detection: skips if a complete DCD already exists
-    - Checkpoint save every 100k steps so runtime drops lose minimal progress
-    - Checkpoint resume: picks up where it left off if a .chk file exists
-    - Verbose stdout reporter with progress % and ns/day speed
+    - Checkpoint save every 100k steps
+    - Checkpoint resume from .chk file
+    - Live status widget (passed in from run_temperature_screen)
     """
     from openmm.app import DCDReporter, StateDataReporter, CheckpointReporter
     from openmm import LangevinMiddleIntegrator, Platform, Vec3
     import openmm.unit as unit
-    import gc
+    import gc, threading
 
     os.makedirs(output_dir, exist_ok=True)
     _t_str   = f"{temperature_K:.4f}".rstrip('0').rstrip('.')
@@ -468,19 +581,38 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
     csv_file = os.path.join(output_dir, f"energy_{tag}.csv")
     chk_file = os.path.join(output_dir, f"checkpoint_{tag}.chk")
 
+    # ── Update widget ─────────────────────────────────────────────────────────
+    if widgets_dict:
+        _kB      = 0.008314
+        _epsilon = getattr(sbm, '_epsilon', 3.0)
+        T_real   = (temperature_K * _epsilon / _kB
+                    if temperature_K < 10.0 else temperature_K)
+        widgets_dict['temp_label'].value = (
+            f"<b>Temperature:</b> T* = {temperature_K} "
+            f"&nbsp;({T_real:.1f} K)")
+        widgets_dict['temp_num'].value = (
+            f"<b>Simulation:</b> {temp_idx} of {n_temps}")
+        widgets_dict['progress_bar'].value    = 0
+        widgets_dict['progress_label'].value  = '<b>0%</b>'
+        widgets_dict['speed_label'].value     = '<b>Speed:</b> --'
+        widgets_dict['eta_label'].value       = '<b>ETA:</b> --'
+
     # ── Completion check ─────────────────────────────────────────────────────
     expected_frames = int(n_steps / report_interval)
     _dcd_exists = os.path.exists(dcd_file)
     _csv_exists = os.path.exists(csv_file)
     _chk_exists = os.path.exists(chk_file)
-    print(f'  Checking for existing files for T*={temperature_K}:')
-    print(f'    DCD: {_dcd_exists}  CSV: {_csv_exists}  CHK: {_chk_exists}')
-    print(f'    Expected frames: {expected_frames}')
+
     if _dcd_exists and _csv_exists:
         try:
             _df = pd.read_csv(csv_file, comment=None)
             actual_frames = len(_df)
             if actual_frames >= int(expected_frames * 0.95):
+                if widgets_dict:
+                    widgets_dict['progress_bar'].value   = 100
+                    widgets_dict['progress_label'].value = '<b>100% (cached)</b>'
+                    widgets_dict['speed_label'].value    = '<b>Speed:</b> --'
+                    widgets_dict['eta_label'].value      = '<b>ETA:</b> complete'
                 print(f'  T* = {temperature_K} already complete '
                       f'({actual_frames}/{expected_frames} frames) -- skipping.')
                 return dcd_file, csv_file
@@ -490,16 +622,18 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
     # ── Check for partial run to resume ──────────────────────────────────────
     steps_done = 0
     resume     = False
-    if os.path.exists(chk_file) and os.path.exists(csv_file):
+    if _chk_exists and _csv_exists:
         try:
             _df        = pd.read_csv(csv_file, comment=None)
-            # OpenMM writes step column as '#"Step"' -- use position not name
             steps_done = int(_df.iloc[-1, 0]) if len(_df) > 0 else 0
             if 0 < steps_done < n_steps:
                 resume = True
-                pct    = steps_done / n_steps * 100
+                pct    = int(steps_done / n_steps * 100)
                 print(f'  Checkpoint found for T* = {temperature_K} '
-                      f'({pct:.1f}% complete, resuming from step {steps_done:,})')
+                      f'({pct}% complete, resuming from step {steps_done:,})')
+                if widgets_dict:
+                    widgets_dict['progress_bar'].value   = pct
+                    widgets_dict['progress_label'].value = f'<b>{pct}% (resuming)</b>'
         except Exception:
             pass
 
@@ -575,17 +709,20 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
     sbm.simulation.reporters.append(
         StateDataReporter(open(csv_file, _csv_mode), report_interval,
                           step=True, time=True, potentialEnergy=True,
-                          temperature=True, separator=','))
-    sbm.simulation.reporters.append(
-        StateDataReporter(sys.stdout, report_interval * 10,
-                          step=True, potentialEnergy=True,
-                          kineticEnergy=True, totalEnergy=True,
-                          temperature=True, progress=True,
-                          remainingTime=True, speed=True,
-                          totalSteps=n_steps, separator=','))
-    # Checkpoint every 100k steps -- survives Colab runtime drops
+                          temperature=True, speed=True, separator=','))
     sbm.simulation.reporters.append(
         CheckpointReporter(chk_file, 100_000))
+
+    # ── Start background widget updater ───────────────────────────────────────
+    _stop_event = threading.Event()
+    _update_status._stop = _stop_event
+    if widgets_dict:
+        _t = threading.Thread(
+            target=_update_status,
+            args=(widgets_dict, temperature_K, temp_idx, n_temps,
+                  csv_file, n_steps, report_interval, timestep_ps),
+            daemon=True)
+        _t.start()
 
     # ── Run with NaN restart logic ────────────────────────────────────────────
     remaining    = n_steps - steps_done
@@ -617,6 +754,15 @@ def run_openmm_simulation(sbm, temperature_K, output_dir, n_steps=5_000_000,
             else:
                 raise
 
+    # Stop background updater
+    _stop_event.set()
+
+    # Final widget update
+    if widgets_dict:
+        widgets_dict['progress_bar'].value   = 100
+        widgets_dict['progress_label'].value = '<b>100%</b>'
+        widgets_dict['eta_label'].value      = '<b>ETA:</b> complete'
+
     print(f'  Done -> {dcd_file}')
     return dcd_file, csv_file
 
@@ -625,18 +771,34 @@ def run_temperature_screen(sbm, temperatures, output_dir, n_steps=5_000_000,
                            report_interval=1000, timestep_ps=0.0005,
                            friction=1.0, platform='CPU'):
     """Run independent simulations across a list of temperatures."""
+
+    # Create status widget
+    try:
+        _widgets = _make_status_widget()
+    except Exception:
+        _widgets = None   # graceful fallback if not in notebook environment
+
     results = []
-    for T in temperatures:
+    for idx, T in enumerate(temperatures):
         dcd, csv = run_openmm_simulation(
             sbm, T, output_dir,
             n_steps=n_steps, report_interval=report_interval,
-            timestep_ps=timestep_ps, friction=friction, platform=platform)
+            timestep_ps=timestep_ps, friction=friction, platform=platform,
+            widgets_dict=_widgets,
+            temp_idx=idx + 1,
+            n_temps=len(temperatures))
         results.append({'temperature_K': T, 'dcd': dcd, 'csv': csv})
+
+    if _widgets:
+        _widgets['temp_label'].value  = '<b>Temperature:</b> All complete ✓'
+        _widgets['temp_num'].value    = (
+            f'<b>Simulations:</b> {len(temperatures)} of {len(temperatures)}')
 
     summary = pd.DataFrame(results)
     summary.to_csv(os.path.join(output_dir, 'simulation_index.csv'), index=False)
     print(f'\nScreen complete. {len(results)} simulations finished.')
     return summary
+
 
 def run_analysis(wrkdir, top_file, cont_file, cut_off, tlow, thigh):
     """Run complete analysis pipeline over all temperature simulations."""
